@@ -141,6 +141,9 @@
   <ItemGroup>
     <ClCompile Include="hello.c" />
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="MemoryLeak.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
