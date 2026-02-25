@@ -1,10 +1,240 @@
-#include <ncurses.h>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
+#include <cstdarg>
 #include <vector>
 #include <algorithm>
 #include <random>
 #include <chrono>
+
+// ============================================================
+// Windows Console — ncurses-compatible shim
+// (replaces #include <ncurses.h>)
+// ============================================================
+
+// Key codes (replacing ncurses KEY_*)
+#define KEY_LEFT   0x10000
+#define KEY_RIGHT  0x10001
+#define KEY_UP     0x10002
+#define KEY_DOWN   0x10003
+#define ERR        (-1)
+
+// Attribute flags (replacing ncurses A_*)
+#define A_BOLD        0x20000000
+#define A_DIM         0x10000000
+#define COLOR_PAIR(n) (0x40000000 | ((n) & 0xFF))
+
+// ncurses color constants
+#define COLOR_BLACK   0
+#define COLOR_RED     1
+#define COLOR_GREEN   2
+#define COLOR_YELLOW  3
+#define COLOR_BLUE    4
+#define COLOR_MAGENTA 5
+#define COLOR_CYAN    6
+#define COLOR_WHITE   7
+
+// Screen size
+static const int SCR_W = 80;
+static const int SCR_H = 30;
+
+static HANDLE    hOut;
+static HANDLE    hIn;
+static CHAR_INFO screenBuf[SCR_H][SCR_W];
+static WORD      colorPairs[16]  = {};
+static int       g_curPair       = 0;
+static bool      g_bold          = false;
+static bool      g_dim           = false;
+static bool      g_nodelay_mode  = false;
+static void*     stdscr          = nullptr;
+
+// Map ncurses color index -> Windows foreground bits
+static WORD fgBits(int c) {
+    const WORD t[8] = {
+        0,
+        FOREGROUND_RED,
+        FOREGROUND_GREEN,
+        FOREGROUND_RED | FOREGROUND_GREEN,
+        FOREGROUND_BLUE,
+        FOREGROUND_RED | FOREGROUND_BLUE,
+        FOREGROUND_GREEN | FOREGROUND_BLUE,
+        FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE,
+    };
+    return (c >= 0 && c < 8) ? t[c] : 0;
+}
+
+// Map ncurses color index -> Windows background bits
+static WORD bgBits(int c) {
+    const WORD t[8] = {
+        0,
+        BACKGROUND_RED,
+        BACKGROUND_GREEN,
+        BACKGROUND_RED | BACKGROUND_GREEN,
+        BACKGROUND_BLUE,
+        BACKGROUND_RED | BACKGROUND_BLUE,
+        BACKGROUND_GREEN | BACKGROUND_BLUE,
+        BACKGROUND_RED | BACKGROUND_GREEN | BACKGROUND_BLUE,
+    };
+    return (c >= 0 && c < 8) ? t[c] : 0;
+}
+
+static WORD currentWinAttr() {
+    WORD w = colorPairs[g_curPair];
+    if (g_bold) w |= FOREGROUND_INTENSITY;
+    return w;
+}
+
+// ---- ncurses init / cleanup stubs ----
+
+static void initscr() {
+    hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    hIn  = GetStdHandle(STD_INPUT_HANDLE);
+
+    // Disable echo and line-input
+    SetConsoleMode(hIn, 0);
+    SetConsoleTitleA("Tetris");
+
+    // Shrink window first so buffer resize can succeed
+    SMALL_RECT tiny = {0, 0, 1, 1};
+    SetConsoleWindowInfo(hOut, TRUE, &tiny);
+
+    COORD bufSize = {(SHORT)SCR_W, (SHORT)SCR_H};
+    SetConsoleScreenBufferSize(hOut, bufSize);
+
+    SMALL_RECT win = {0, 0, (SHORT)(SCR_W - 1), (SHORT)(SCR_H - 1)};
+    SetConsoleWindowInfo(hOut, TRUE, &win);
+
+    memset(screenBuf, 0, sizeof(screenBuf));
+}
+
+static void cbreak()           {}
+static void noecho()           {}
+static void keypad(void*, int) {}
+
+static void curs_set(int) {
+    CONSOLE_CURSOR_INFO ci = {};
+    ci.dwSize   = 1;
+    ci.bVisible = FALSE;
+    SetConsoleCursorInfo(hOut, &ci);
+}
+
+static bool has_colors()  { return true; }
+static void start_color() {}
+
+static void init_pair(int n, int fg, int bg) {
+    if (n >= 0 && n < 16)
+        colorPairs[n] = fgBits(fg) | bgBits(bg);
+}
+
+static void nodelay(void*, int nd) { g_nodelay_mode = (nd != 0); }
+
+// ---- Attribute control ----
+
+static void attron(int a) {
+    if (a & 0x40000000) g_curPair = a & 0xFF;
+    if (a & A_BOLD)     g_bold    = true;
+    if (a & A_DIM)      g_dim     = true;
+}
+
+static void attroff(int a) {
+    if (a & 0x40000000) g_curPair = 0;   // reset to default pair
+    if (a & A_BOLD)     g_bold    = false;
+    if (a & A_DIM)      g_dim     = false;
+}
+
+// ---- Screen buffer helpers ----
+
+static void scr_put(int y, int x, char ch) {
+    if (y < 0 || y >= SCR_H || x < 0 || x >= SCR_W) return;
+    screenBuf[y][x].Char.AsciiChar = ch;
+    screenBuf[y][x].Attributes     = currentWinAttr();
+}
+
+static void mvaddch(int y, int x, char ch) { scr_put(y, x, ch); }
+
+static void mvaddstr(int y, int x, const char* s) {
+    while (*s) scr_put(y, x++, *s++);
+}
+
+static void mvprintw(int y, int x, const char* fmt, ...) {
+    char    buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    mvaddstr(y, x, buf);
+}
+
+static void erase() {
+    for (int r = 0; r < SCR_H; r++)
+        for (int c = 0; c < SCR_W; c++) {
+            screenBuf[r][c].Char.AsciiChar = ' ';
+            screenBuf[r][c].Attributes     = 0;
+        }
+}
+
+static void refresh() {
+    COORD      sz  = {(SHORT)SCR_W, (SHORT)SCR_H};
+    COORD      org = {0, 0};
+    SMALL_RECT dst = {0, 0, (SHORT)(SCR_W - 1), (SHORT)(SCR_H - 1)};
+    WriteConsoleOutputA(hOut, (CHAR_INFO*)screenBuf, sz, org, &dst);
+}
+
+static void napms(int ms) { Sleep((DWORD)ms); }
+
+static void endwin() {
+    CONSOLE_CURSOR_INFO ci = {};
+    ci.dwSize   = 25;
+    ci.bVisible = TRUE;
+    SetConsoleCursorInfo(hOut, &ci);
+    SetConsoleTextAttribute(hOut, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+    SetConsoleMode(hIn, ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+}
+
+// Non-blocking or blocking getch depending on g_nodelay_mode
+static int getch() {
+    if (g_nodelay_mode) {
+        DWORD n = 0;
+        if (!GetNumberOfConsoleInputEvents(hIn, &n) || n == 0) return ERR;
+        INPUT_RECORD ir;
+        DWORD        rd = 0;
+        while (n-- > 0) {
+            ReadConsoleInputA(hIn, &ir, 1, &rd);
+            if (ir.EventType != KEY_EVENT || !ir.Event.KeyEvent.bKeyDown) continue;
+            switch (ir.Event.KeyEvent.wVirtualKeyCode) {
+                case VK_LEFT:  return KEY_LEFT;
+                case VK_RIGHT: return KEY_RIGHT;
+                case VK_UP:    return KEY_UP;
+                case VK_DOWN:  return KEY_DOWN;
+            }
+            if (ir.Event.KeyEvent.uChar.AsciiChar)
+                return (unsigned char)ir.Event.KeyEvent.uChar.AsciiChar;
+        }
+        return ERR;
+    } else {
+        for (;;) {
+            INPUT_RECORD ir;
+            DWORD        rd = 0;
+            ReadConsoleInputA(hIn, &ir, 1, &rd);
+            if (ir.EventType != KEY_EVENT || !ir.Event.KeyEvent.bKeyDown) continue;
+            switch (ir.Event.KeyEvent.wVirtualKeyCode) {
+                case VK_LEFT:  return KEY_LEFT;
+                case VK_RIGHT: return KEY_RIGHT;
+                case VK_UP:    return KEY_UP;
+                case VK_DOWN:  return KEY_DOWN;
+            }
+            if (ir.Event.KeyEvent.uChar.AsciiChar)
+                return (unsigned char)ir.Event.KeyEvent.uChar.AsciiChar;
+        }
+    }
+}
+
+// ============================================================
+// Tetris game
+// ============================================================
 
 // Board dimensions
 static const int BOARD_WIDTH  = 10;
